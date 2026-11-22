@@ -1,0 +1,141 @@
+<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>P7S Open</title><meta name=description content="Open a signed .p7s file in your browser: get the original document back and see who signed it. Nothing is uploaded.">
+<meta property=og:title content="P7S Open"><meta property=og:description content="Got a .p7s file you can't open? Drop it here and get the original PDF/DOCX back. Runs 100% in your browser.">
+<meta property=og:image content="https://econnx.github.io/p7s-open/preview.png"><meta name=twitter:card content=summary_large_image>
+<style>
+:root{--bg:#f4f1ea;--ink:#141414;--mut:#5f5f5f;--card:#fff;--acc:#2f6bff;--ok:#16794a;--bad:#b3261e;--line:#d9d4c8}
+@media (prefers-color-scheme:dark){:root{--bg:#111213;--ink:#eeeae2;--mut:#a3a09a;--card:#1b1c1e;--acc:#7da2ff;--ok:#5fd39a;--bad:#ff8a80;--line:#2e2f33}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 -apple-system,'Segoe UI',Roboto,sans-serif}
+main{max-width:760px;margin:auto;padding:48px 16px 64px}
+h1{font-size:44px;letter-spacing:-1.5px;margin:0 0 6px}h1 span{color:var(--acc)}
+.sub{color:var(--mut);margin:0 0 28px;font-size:18px}
+#drop{border:2.5px dashed var(--line);border-radius:18px;background:var(--card);padding:44px 20px;text-align:center;cursor:pointer;transition:.15s}
+#drop.on{border-color:var(--acc);transform:scale(1.01)}#drop b{font-size:20px}#drop small{display:block;color:var(--mut);margin-top:6px}
+.res{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;margin-top:20px}
+.res h3{margin:0 0 4px;word-break:break-all}.mut{color:var(--mut)}
+.btn{display:inline-block;margin-top:12px;padding:10px 18px;border-radius:10px;background:var(--acc);color:#fff;text-decoration:none;font-weight:600}
+.err{color:var(--bad)}.ok{color:var(--ok)}
+table{border-collapse:collapse;width:100%;margin-top:12px;font-size:14px}td{padding:6px 8px;border-top:1px solid var(--line);vertical-align:top;word-break:break-word}td:first-child{color:var(--mut);width:34%}
+details{margin-top:36px;color:var(--mut)}summary{cursor:pointer;color:var(--ink);font-weight:600}a{color:var(--acc)}
+footer{margin-top:40px;color:var(--mut);font-size:14px}
+</style>
+<main>
+<h1>P7S <span>Open</span></h1>
+<p class=sub>Got a signed <b>.p7s</b> file and your Mac/PC can't open it? Drop it here: you get the original document back and see who signed it and when. Runs 100% in your browser — the file never leaves your device.</p>
+<label id=drop><input id=f type=file accept=".p7s,.p7m,.sig,.pkcs7,application/pkcs7-mime,application/pkcs7-signature" multiple hidden>
+<b>Drop .p7s / .p7m files here</b><small>or click to choose · several at once is fine</small></label>
+<div id=out></div>
+<details><summary>What is a .p7s file?</summary>
+<p>It is a CMS / PKCS#7 container: the original file plus one or more digital signatures (for example a Ukrainian КЕП made with Diia or id.gov.ua, or an EU qualified signature). Operating systems don't know how to open it, so the document looks "broken". The document is still inside, untouched.</p>
+<p>This page reads the container with a small ASN.1 parser written in plain JavaScript, takes out the embedded document and lists the certificates of the signers. It does <b>not</b> check that the signature is cryptographically valid (that needs the CA's trust lists) — for an official check use your government's signature verification service.</p>
+<p>If the result says the signature is <i>detached</i>, the .p7s contains only the signature and the original file was sent separately.</p></details>
+<footer>Free and open source · <a href="https://github.com/econnx/p7s-open">GitHub</a> · made by <a href="https://x.com/Econnx1">@Econnx1</a></footer>
+</main>
+<script>
+// ---------- minimal BER/DER reader ----------
+function read(b, p) { // -> {tag, cls, cons, start(header), hl, len (or -1), end}
+  const t0 = b[p]; let q = p + 1; let tag = t0 & 31;
+  if (tag === 31) { tag = 0; let c; do { c = b[q++]; tag = tag * 128 + (c & 127); } while (c & 128); }
+  let l = b[q++], len;
+  if (l === 0x80) len = -1;
+  else if (l & 0x80) { const n = l & 127; len = 0; for (let i = 0; i < n; i++) len = len * 256 + b[q++]; }
+  else len = l;
+  const node = { tag, cls: t0 >> 6, cons: !!(t0 & 32), start: p, body: q, b };
+  if (len >= 0) { node.end = q + len; }
+  else { // indefinite: walk children until 00 00
+    let r = q; while (!(b[r] === 0 && b[r + 1] === 0)) r = read(b, r).end;
+    node.end = r + 2; node.bodyEnd = r;
+  }
+  if (node.bodyEnd === undefined) node.bodyEnd = node.end;
+  if (node.end > b.length) throw new Error("file is truncated or not a signature container");
+  return node;
+}
+function kids(n) { const a = []; let p = n.body; while (p < n.bodyEnd) { const k = read(n.b, p); a.push(k); p = k.end; } return a; }
+function bytes(n) { // primitive value, or concatenation for constructed OCTET STRING
+  if (!n.cons) return n.b.subarray(n.body, n.bodyEnd);
+  const parts = kids(n).map(bytes); const tot = parts.reduce((s, x) => s + x.length, 0);
+  const o = new Uint8Array(tot); let i = 0; for (const x of parts) { o.set(x, i); i += x.length; } return o;
+}
+function oid(n) { const v = bytes(n); const r = [Math.floor(v[0] / 40), v[0] % 40]; let x = 0;
+  for (let i = 1; i < v.length; i++) { x = x * 128 + (v[i] & 127); if (!(v[i] & 128)) { r.push(x); x = 0; } } return r.join("."); }
+function str(n) { const v = bytes(n);
+  if (n.tag === 30) { let s = ""; for (let i = 0; i + 1 < v.length; i += 2) s += String.fromCharCode(v[i] << 8 | v[i + 1]); return s; } // BMPString
+  return new TextDecoder(n.tag === 12 ? "utf-8" : "latin1").decode(v);
+}
+function time(n) { const s = str(n); let y, r;
+  if (n.tag === 23) { y = +s.slice(0, 2); y += y < 50 ? 2000 : 1900; r = s.slice(2); } else { y = +s.slice(0, 4); r = s.slice(4); }
+  return new Date(Date.UTC(y, +r.slice(0, 2) - 1, +r.slice(2, 4), +r.slice(4, 6), +r.slice(6, 8), +(r.slice(8, 10) || 0))); }
+
+const NAMES = { "2.5.4.3": "Name", "2.5.4.4": "Surname", "2.5.4.42": "Given name", "2.5.4.10": "Organization", "2.5.4.11": "Unit",
+  "2.5.4.12": "Title", "2.5.4.5": "Serial / ID", "2.5.4.6": "Country", "2.5.4.7": "City", "2.5.4.8": "Region", "2.5.4.97": "Org. ID" };
+function dn(n) { const o = {}; for (const set of kids(n)) for (const atv of kids(set)) { const [k, v] = kids(atv); const key = oid(k); try { o[key] = str(v); } catch {} } return o; }
+function cert(n) {
+  const tbs = kids(kids(n)[0]); let i = 0; if (tbs[0].cls === 2) i = 1; // [0] version
+  const serial = [...bytes(tbs[i])].map(x => x.toString(16).padStart(2, "0")).join("");
+  const issuer = dn(tbs[i + 2]); const [nb, na] = kids(tbs[i + 3]); const subject = dn(tbs[i + 4]);
+  return { serial, issuer, subject, from: time(nb), to: time(na) };
+}
+const isCMS = b => { try { const ci = read(b, 0); if (ci.tag !== 16) return false; const k = kids(ci); return k[0].tag === 6 && oid(k[0]) === "1.2.840.113549.1.7.2"; } catch { return false; } };
+
+function parse(b) {
+  const sd = kids(kids(kids(read(b, 0))[1])[0]);  // ContentInfo -> [0] -> SignedData
+  const enc = kids(sd[2]); let content = null;
+  if (enc[1]) content = bytes(kids(enc[1])[0]);
+  const certs = [], signers = [];
+  for (const k of sd.slice(3)) {
+    if (k.cls === 2 && k.tag === 0) for (const c of kids(k)) { try { if (c.tag === 16) certs.push(cert(c)); } catch {} }
+    if (k.cls === 0 && k.tag === 17) for (const si of kids(k)) {
+      const s = {}; for (const f of kids(si)) if (f.cls === 2 && f.tag === 0) for (const a of kids(f)) {
+        const [t, vals] = kids(a); if (oid(t) === "1.2.840.113549.1.9.5") try { s.time = time(kids(vals)[0]); } catch {} }
+      signers.push(s);
+    }
+  }
+  return { content, certs, signers, type: oid(enc[0]) };
+}
+function sniff(b, base) {
+  const h = s => [...s].every((c, i) => b[i] === c.charCodeAt(0));
+  let ext = (base.match(/\.([a-z0-9]{2,5})$/i) || [])[1];
+  if (ext) return { name: base, mime: "" };
+  if (h("%PDF")) ext = "pdf"; else if (h("PK")) { const t = new TextDecoder("latin1").decode(b.subarray(0, 3000));
+    ext = t.includes("word/") ? "docx" : t.includes("xl/") ? "xlsx" : t.includes("ppt/") ? "pptx" : t.includes("mimetypeapplication/vnd.oasis") ? "odt" : "zip"; }
+  else if (h("\x89PNG")) ext = "png"; else if (h("\xff\xd8")) ext = "jpg"; else if (h("{\\rtf")) ext = "rtf"; else if (h("<?xml")) ext = "xml"; else ext = "bin";
+  return { name: base + "." + ext };
+}
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const fmt = d => d && !isNaN(d) ? d.toLocaleString() : "—";
+
+async function handle(file) {
+  const box = document.createElement("div"); box.className = "res"; out.prepend(box);
+  try {
+    let b = new Uint8Array(await file.arrayBuffer());
+    const txt = new TextDecoder("latin1").decode(b.subarray(0, 64)).trim();
+    if (/^(-----BEGIN|MI)/.test(txt)) { // base64 / PEM
+      const s = new TextDecoder().decode(b).replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+      b = Uint8Array.from(atob(s), c => c.charCodeAt(0));
+    }
+    if (!isCMS(b)) throw new Error("this doesn't look like a .p7s / CMS signature container");
+    let base = file.name.replace(/\.(p7s|p7m|sig|pkcs7)$/i, ""), layers = [], content;
+    while (isCMS(b)) { const r = parse(b); layers.push(r); if (!r.content) break; content = b = r.content; base = base.replace(/\.(p7s|p7m)$/i, ""); }
+    const certs = layers.flatMap(l => l.certs), times = layers.flatMap(l => l.signers.map(s => s.time)).filter(Boolean);
+    let html = `<h3>${esc(file.name)}</h3>`;
+    if (content && !isCMS(content)) {
+      const { name } = sniff(content, base); const url = URL.createObjectURL(new Blob([content]));
+      html += `<div class=ok>✓ Original document found (${(content.length / 1024).toFixed(1)} KB${layers.length > 1 ? `, ${layers.length} nested signatures` : ""})</div>
+        <a class=btn href="${url}" download="${esc(name)}">Download ${esc(name)}</a>`;
+    } else html += `<div class=mut>This is a <b>detached</b> signature: the .p7s holds only the signature. The signed document was sent as a separate file.</div>`;
+    html += `<table><tr><td>Signatures</td><td>${layers.reduce((s, l) => s + l.signers.length, 0)}</td></tr>`;
+    if (times.length) html += `<tr><td>Signed at</td><td>${times.map(fmt).join("<br>")}</td></tr>`;
+    for (const c of certs) {
+      const s = c.subject, who = s["2.5.4.3"] || [s["2.5.4.4"], s["2.5.4.42"]].filter(Boolean).join(" ") || "(no name)";
+      html += `<tr><td>Certificate</td><td><b>${esc(who)}</b>${s["2.5.4.10"] ? "<br>" + esc(s["2.5.4.10"]) : ""}${s["2.5.4.12"] ? " · " + esc(s["2.5.4.12"]) : ""}
+        <br><span class=mut>issued by ${esc(c.issuer["2.5.4.3"] || c.issuer["2.5.4.10"] || "?")} · valid ${fmt(c.from).split(",")[0]} – ${fmt(c.to).split(",")[0]}</span></td></tr>`;
+    }
+    box.innerHTML = html + "</table>";
+  } catch (e) { box.innerHTML = `<h3>${esc(file.name)}</h3><div class=err>✗ ${esc(e.message)}</div>`; }
+}
+const out = document.getElementById("out"), drop = document.getElementById("drop"), inp = document.getElementById("f");
+inp.onchange = () => [...inp.files].forEach(handle);
+["dragenter", "dragover"].forEach(e => addEventListener(e, ev => { ev.preventDefault(); drop.classList.add("on"); }));
+["dragleave", "drop"].forEach(e => addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove("on"); }));
+addEventListener("drop", ev => [...ev.dataTransfer.files].forEach(handle));
+</script></html>
